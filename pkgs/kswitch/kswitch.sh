@@ -87,7 +87,15 @@ kill-tunnel() {
   ssh -S /dev/shm/kswitch -O exit foo 2>/dev/null || true
 }
 
-tunnel() {
+vault_login() {
+    vault token lookup >/dev/null 2>&1 || vault login -method oidc
+}
+
+vault_config() {
+    vault read "secret/zones/fe/${zone}/kubeconfig" -format=json
+}
+
+kubeconfig_bastion() {
   dest=cloud@bst.${zone}.caascad.com
 
   if [ ! -f ${configDir}/${zone} ]; then
@@ -106,12 +114,38 @@ tunnel() {
     rm -f $kubeconfig
     log "Configuration for ${zone} is completed!"
   fi
-
-  kube=$(cat ${configDir}/${zone})
-
-  log "Forwarding through ${dest}..."
-  ssh -4 -M -S /dev/shm/kswitch -fnNT -L ${localPort}:${kube} -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 $dest
 }
+
+kubeconfig_vault() {
+    if ! kubectl config get-contexts ocb-test01 >/dev/null 2>&1; then
+        log "No configuration has been found for zone ${zone}"
+        log "Fetching zone info on ${VAULT_ADDR}"
+        log "Configuring kube credentials for zone ${zone}..."
+        run "kubectl config set-credentials $zone-admin --exec-api-version=client.authentication.k8s.io/v1beta1 --exec-command=kswitch --exec-arg=-v --exec-arg=-c --exec-arg=${zone}"
+        log "Configuring kube context for zone ${zone}..."
+        run "kubectl config set-context $zone --user=${zone}-admin --cluster=tunnel"
+    fi
+}
+
+tunnel() {
+    dest=cloud@bst.${zone}.caascad.com
+
+    if [ $useVault -eq 1 ]; then
+        vault_login
+        kube=$(vault_config | jq -r .data.clusters[].cluster.server | cut -d'/' -f3)
+    else
+        kube=$(cat ${configDir}/${zone})
+    fi
+    log "Forwarding through ${dest}..."
+    ssh -4 -M -S /dev/shm/kswitch -fnNT -L ${localPort}:${kube} -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 $dest
+}
+
+credentials() {
+  vault_login
+  vault_config | jq '{"apiVersion": "client.authentication.k8s.io/v1beta1", "kind": "ExecCredential", "status": { "clientCertificateData": .data.users[].user["client-certificate-data"] | @base64d, "clientKeyData": .data.users[].user["client-key-data"] | @base64d }}'
+  exit 0
+}
+
 
 status() {
   context=$(kubectl config current-context)
@@ -129,10 +163,13 @@ status() {
 
 localPort=30000
 configDir=$HOME/.config/kswitch
+zoneVault="infra-stg"
 zone=""
+useVault=0
+execCredentialMode=0
 
-for arg in "$@"; do
-    case "$arg" in
+while (( "$#" )); do
+    case "$1" in
         bash-completions)
         bash-completions
         exit 0
@@ -145,9 +182,17 @@ for arg in "$@"; do
         kill-tunnel
         exit 0
         ;;
+        -v|--vault)
+        useVault=1
+        shift
+        ;;
+        -c)
+        execCredentialMode=1
+        shift
+        ;;
         *)
         [ "$zone" != "" ] && (echo -e "Error: too much arguments\n" && usage && exit 1)
-        zone=$arg
+        zone=$1
         shift
         ;;
     esac
@@ -156,7 +201,11 @@ done
 # Makes sure to use ~/.kube/config
 unset KUBECONFIG
 
+export VAULT_ADDR="https://vault.${zoneVault}.caascad.com"
+
 [ "$zone" == "" ] && status
+
+[ $execCredentialMode -eq 1 ] && credentials
 
 setup
 
@@ -165,6 +214,11 @@ zoneCluster=$(kubectl config view -o json | jq -r "select(.contexts != null) |.c
 kill-tunnel
 
 if [ "$zoneCluster" = "tunnel" ] || [ "$zoneCluster" = "" ]; then
+  if [ $useVault -eq 1 ]; then
+    kubeconfig_vault
+  else
+    kubeconfig_bastion
+  fi
   tunnel
 fi
 
